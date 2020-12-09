@@ -1,0 +1,309 @@
+---
+- hosts: multi
+  any_errors_fatal: true
+  gather_facts: yes
+  become: yes
+ 
+  tasks:
+  - name: Set Hostnames
+    hostname:
+      name: "{{ hostname }}"
+
+  - name: set selinux to permissive
+    selinux:
+      policy: targeted
+      state: permissive
+    when: ansible_distribution == 'CentOS' or ansible_distribution == 'Red Hat Enterprise Linux'
+  
+  - name: yum update all system packages to latest (rhel)
+    yum: name=* state=latest
+    when: ansible_distribution == 'CentOS' or ansible_distribution == 'Red Hat Enterprise Linux'
+
+  - name: check if reboot is needed after kernel update (rhel)
+    shell: LAST_KERNEL=$(rpm -q --last kernel | awk 'NR==1{sub(/kernel-/,""); print $1}'); CURRENT_KERNEL=$(uname -r); if [ $LAST_KERNEL != $CURRENT_KERNEL ]; then echo 'reboot'; else echo 'no'; fi
+    ignore_errors: true
+    register: reboot_hint_rhel
+    when: ansible_distribution == 'CentOS' or ansible_distribution == 'Red Hat Enterprise Linux'
+
+  - name: apt update all system packages to latest (deb)
+    apt: name=* state=latest
+    when: ansible_distribution == 'Ubuntu' or ansible_distribution == 'Debian'
+
+  - name: add Docker CE repo (rhel)
+    get_url:
+      url: https://download.docker.com/linux/centos/docker-ce.repo
+      dest: /etc/yum.repos.d/docker-ce.repo
+      mode: 0644
+    when: ansible_distribution == 'CentOS' or ansible_distribution == 'Red Hat Enterprise Linux'
+
+  - name: add Kubernetes repo (rhel)
+    template: 
+      src: kubernetes.repo
+      dest: /etc/yum.repos.d/kubernetes.repo
+      mode: 0644
+    when: ansible_distribution == 'CentOS' or ansible_distribution == 'Red Hat Enterprise Linux'
+
+  - name: install pre-reqs for apt (deb)
+    apt:
+      name:
+        - gnupg2
+        - ca-certificates
+        - curl
+        - gnupg2
+        - software-properties-common
+        - apt-transport-https
+      update_cache: yes
+      state: latest
+    when: ansible_distribution == 'Ubuntu' or ansible_distribution == 'Debian'
+
+  - name: add Docker CE repo key (deb)
+    apt_key:
+      url: https://download.docker.com/linux/ubuntu/gpg
+      id: 7EA0A9C3F273FCD8
+      state: present
+    when: ansible_distribution == 'Ubuntu' or ansible_distribution == 'Debian'
+
+  - name: add Docker CE repo (deb)
+    apt_repository:
+      repo: deb [arch=amd64] https://download.docker.com/linux/ubuntu focal stable
+      state: present
+      update_cache: true
+    when: ansible_distribution == 'Ubuntu' or ansible_distribution == 'Debian'
+
+  - name: add Kubernetes repo key (deb)
+    apt_key:
+      url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
+      state: present
+    when: ansible_distribution == 'Ubuntu' or ansible_distribution == 'Debian'
+
+  - name: add Kubernetes repo (deb)
+    apt_repository:
+      repo: deb https://apt.kubernetes.io/ kubernetes-xenial main
+      state: present
+    when: ansible_distribution == 'Ubuntu' or ansible_distribution == 'Debian'
+
+  - name: add sysctl settings
+    template:
+      src: sysctl-k8s.conf
+      dest: /etc/sysctl.d/k8s.conf
+      mode: 0644
+
+  - name: add .bashrc with kube stuff
+    template:
+      src: bashrc
+      dest: /root/.bashrc
+      mode: 0644
+  
+  - name: reload sysctl
+    command: sysctl --system
+
+  - name: remove swap from /etc/fstab
+    mount:
+      name: "{{ item }}"
+      fstype: swap
+      state: absent
+    with_items:
+      - swap
+      - none
+
+  - name: disable swap
+    command: swapoff -a
+
+  - name: install common packages (rhel)
+    yum:
+      name:
+        - yum-utils
+        - lvm2
+        - bash-completion
+        - kernel-devel
+        - git
+        - vim
+        - docker-ce
+        - http://mirror.centos.org/centos/7/extras/x86_64/Packages/container-selinux-2.107-3.el7.noarch.rpm
+        - kubelet
+        - kubeadm
+        - kubectl
+      update_cache: yes
+      state: latest
+    when: ansible_distribution == 'CentOS' or ansible_distribution == 'Red Hat Enterprise Linux'
+
+  - name: install common packages (deb)
+    apt:
+      name:
+        - nvme-cli
+        - iptables
+        - arptables
+        - lvm2
+        - thin-provisioning-tools
+        - bash-completion
+        - git
+        - vim
+        - docker-ce
+        - kubelet
+        - kubeadm
+        - kubectl
+      update_cache: yes
+      state: latest
+    when: ansible_distribution == 'Ubuntu' or ansible_distribution == 'Debian'
+
+  - name: start and enable docker
+    systemd:
+      name: docker.service
+      state: started
+      enabled: yes
+
+  - name: start and enable kubelet
+    systemd:
+      name: kubelet
+      daemon_reload: yes
+      state: started
+      enabled: yes
+  
+  - name: create drbdpool volume group for LINSTOR
+    lvg:
+      vg: drbdpool
+      pvs: "{{ drbd_backing_disk }}"
+    tags: linstor
+  
+  - name: create thin LVM on drbdpool
+    lvol:
+      vg: drbdpool
+      thinpool: thinpool
+      size: 80%VG
+    tags: linstor
+
+- hosts: k8s_master
+  any_errors_fatal: true
+  gather_facts: yes
+  become: yes
+ 
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+      
+  tasks:
+  - name: disable firewalld
+    systemd:
+      name: firewalld
+      state: stopped
+      enabled: no
+    when: ansible_distribution == 'CentOS' or ansible_distribution == 'Red Hat Enterprise Linux'
+
+  - name: disable ufw
+    command: "ufw disable"
+    when: ansible_distribution == 'Ubuntu' or ansible_distribution == 'Debian'
+
+  - name: kubeadm init the cluster
+    command: "kubeadm init --token linbit.sup4rsecr3tpa55w --apiserver-advertise-address {{ groups['k8s_master'][0] }} --pod-network-cidr 172.16.0.0/16"
+    tags: kube-init
+
+  - name: add Calico CNI
+    shell: "kubectl apply -f https://docs.projectcalico.org/manifests/calico.yaml"
+
+  - name: remove master taint
+    command: "kubectl taint nodes --all node-role.kubernetes.io/master-"
+    register: rm_master_taint
+    failed_when: ( rm_master_taint.rc not in [ 0, 1 ])
+
+  - name: get a join token
+    command: "kubeadm token create --print-join-command"
+    register: kubeadm_join
+
+  - name: set join string as a fact on master
+    set_fact: join_command={{ kubeadm_join.stdout }}
+
+- hosts: k8s_worker
+  any_errors_fatal: true
+  gather_facts: yes
+  become: yes
+  
+  tasks:
+  - name: disable firewalld
+    systemd:
+      name: firewalld
+      state: stopped
+      enabled: no
+    when: ansible_distribution == 'CentOS' or ansible_distribution == 'Red Hat Enterprise Linux'
+
+  - name: disable ufw
+    command: "ufw disable"
+    when: ansible_distribution == 'Ubuntu' or ansible_distribution == 'Debian'
+
+  - name: join the Kubecluster
+    shell: "{{ hostvars[groups['k8s_master'][0]]['join_command'] }}"
+
+- hosts: k8s_master
+  any_errors_fatal: true
+  gather_facts: yes
+  become: yes
+ 
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+      
+  tasks:
+  - name: copy storage pool layout
+    template:
+      src: linstor-sp-val.yaml
+      dest: /root/
+      mode: 0644
+    tags: linstor
+
+  - name: make sure all nodes are ready
+    shell: "while [ `kubectl get nodes | grep Ready | wc -l` -ne {{ groups['multi'] | length }}  ]; do echo waiting; sleep 2s; done"
+
+  - name: set NODE_STR
+    shell: "kubectl get no -o jsonpath={.items[*].metadata.name} | sed 's/ /,/g'"
+    register: node_str
+    tags: linstor
+  
+  - name: extend PATH for helm3
+    shell: echo $PATH
+    environment:
+      PATH: "/usr/local/bin:{{ ansible_env.PATH }}"
+    tags: linstor
+
+  - name: get helm3 installer script
+    get_url:
+      url: https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3
+      dest: /root/get-helm-3
+      mode: 0755
+    tags: linstor
+
+  - name: install helm3 with installer script
+    shell: bash -c "PATH=$PATH:/usr/local/bin; /root/get-helm-3"
+    tags: linstor
+
+  - name: create drbd.io secret
+    command: "kubectl create secret docker-registry drbdiocred --docker-server=drbd.io --docker-username={{ lb_user }} --docker-email={{ lb_email }} --docker-password={{ lb_pass }}"
+    tags: linstor
+
+  - name: add LINSTOR repo
+    shell: bash -c "/usr/local/bin/helm repo add linstor https://charts.linstor.io"
+    retries: 5
+    delay: 2
+    register: add_linstor_io
+    until: add_linstor_io.rc == 0
+    tags: linstor
+
+  - name: install linstor-etcd-pv
+    command: bash -c "/usr/local/bin/helm install linstor-etcd linstor/pv-hostpath --set nodes={\"{{ node_str.stdout }}\"}"
+    tags: linstor
+
+  - name: install linstor operator (rhel)
+    command: bash -c "/usr/local/bin/helm install -f /root/linstor-sp-val.yaml linstor-op linstor/linstor"
+    tags: linstor
+    when: ansible_distribution == 'CentOS' or ansible_distribution == 'Red Hat Enterprise Linux'
+
+  - name: install linstor operator (deb)
+    command: bash -c "/usr/local/bin/helm install -f /root/linstor-sp-val.yaml --set operator.satelliteSet.kernelModuleInjectionImage=drbd.io/drbd9-bionic --set operator.satelliteSet.kernelModuleInjectionMode=Compile linstor-op linstor/linstor"
+    tags: linstor
+    when: ansible_distribution == 'Ubuntu' or ansible_distribution == 'Debian'
+
+  - name: checkout kermat's pile of LINSTOR yamls
+    git:
+      repo: 'https://github.com/kermat/linstor-csi-k8s-yaml'
+      dest: /root/linstor-csi-k8s-yaml
+    tags: linstor
+
+  - name: apply storageClass yamls from kermat's repo
+    command: "kubectl apply -f /root/linstor-csi-k8s-yaml/sc.yaml"
+    tags: linstor

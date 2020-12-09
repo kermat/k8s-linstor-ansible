@@ -1,0 +1,10 @@
+operator:
+  satelliteSet:
+    storagePools:
+      lvmPools:
+      - name: lvm-thick
+        volumeGroup: drbdpool
+      lvmThinPools:
+      - name: lvm-thin
+        thinVolume: thinpool
+        volumeGroup: drbdpool
