@@ -16,17 +16,17 @@ Adjust the variables in `hosts.ini` accordingly. For example:
 [multi:vars]
 ansible_user=root
 become=yes
-ansible_ssh_private_key_file=~/.ssh/insecure_private_key
 ansible_ssh_common_args='-o StrictHostKeyChecking=no'
 # Linstor variables
 drbd_backing_disk=/dev/sdb
 # my.linbit.com customer portal credentials
 lb_user="fthomas"
 lb_pass="Password1!"
+lb_email="fthomas@somewhere.com"
 ```
 You can only list a single host as a `k8s_master`. That node will be the node you can administer Kubernetes from.
 
-Bring up cluster using Vagrant and run Ansible:
+Bring up cluster using Ansible:
 
 ```sh
 ansible-playbook -i hosts.ini playbook.yaml
@@ -37,6 +37,12 @@ If you don't want to put LINBIT credentials into your `host.ini`, you can run th
 
 ```sh
 ansible-playbook -e lb_user="username" -e lb_pass="password" playbook.yaml
+```
+
+If you're target systems require a sudo password to become root, you can provide the sudo password when running the playbook like this:
+
+```sh
+ansible-playbook -i hosts.ini playbook.yaml -e "ansible_become_pass=superSecretSudoPW1!"
 ```
 
 # Testing Installation
